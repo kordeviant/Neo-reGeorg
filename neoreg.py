@@ -21,7 +21,7 @@ from time import sleep, time, mktime
 from datetime import datetime
 from socket import *
 from itertools import chain
-from threading import Thread
+from threading import Thread, Lock, Event
 
 
 try:
@@ -68,6 +68,12 @@ MAXTHERADS    = 400
 MAXRETRY      = 10
 READINTERVAL  = 300
 WRITEINTERVAL = 200
+REQUEST_TIMEOUT = 10
+REQUEST_DEADLINE = 30
+HEARTBEAT_INTERVAL = 30
+HEARTBEAT_MAX_MISSES = 3
+HEARTBEAT_MODE = 'auto'
+HEARTBEAT_CAPABLE = True
 ASYNCCONNECT     = False
 PHPSKIPCOOKIE = False
 GOSERVER      = False
@@ -113,6 +119,7 @@ BLVHEAD = {
     'PORT':          7,
     'REDIRECTURL':   8,
     'FORCEREDIRECT': 9,
+    'PING':          10,
 }
 BLVHEAD_REVERSE = {}
 for k, v in BLVHEAD.items():
@@ -161,7 +168,7 @@ def blv_decode(data):
         if i > data_len:
             return None
 
-        if b > 0 and b < BLVHEAD_LEN:
+        if b > 0 and b <= BLVHEAD_LEN:
             name = BLVHEAD_REVERSE[b]
             if name != 'DATA':
                 if name != 'ERROR':
@@ -333,6 +340,12 @@ class session(Thread):
         self.fwd_target = FwdTarget
         self.redirectURL = None
         self.force_redirect = force_redirect
+        self.close_lock = Lock()
+        self.request_lock = Lock()
+        self.activity_lock = Lock()
+        self.heartbeat_stop = Event()
+        self.last_data_active = time()
+        self.missed_heartbeats = 0
         if redirectURLs:
             self.redirectURL = random.choice(redirectURLs)
 
@@ -445,35 +458,96 @@ class session(Thread):
         log.debug("[HTTP] [%s:%d] %s Request (%s)" % (self.target, self.port, info['CMD'], self.mark))
 
         retry = 0
-        while True:
-            retry += 1
+        deadline = time() + REQUEST_DEADLINE
+        request_timeout = timeout if timeout is not None else REQUEST_TIMEOUT
+
+        with self.request_lock:
+            while True:
+                retry += 1
+                try:
+                    response = self.conn.post(self.url_sample(), headers=HEADERS, timeout=request_timeout, data=data)
+
+                    second = response.elapsed.total_seconds()
+
+                    log.debug("[HTTP] [%s:%d] %s Response (%s) => HttpCode: %d, Time: %.2fs" % (self.target, self.port, info['CMD'], self.mark, response.status_code, second))
+
+                    if response.status_code >= 500:
+                        raise NeoregReponseFormatError("[HTTP] Server error status: {}".format(response.status_code))
+
+                    rdata = extract_body(response.content)
+                    rinfo = decode_body(rdata)
+                    if rinfo is None:
+                        raise NeoregReponseFormatError("[HTTP] Response Format Error: {}".format(response.content))
+                    else:
+                        if rinfo['STATUS'] != 'OK' and info['CMD'] != 'DISCONNECT':
+                            log.warning('[%s] [%s:%d] Error: %s' % (info['CMD'], self.target, self.port, rinfo['ERROR']))
+                        return rinfo
+
+                except requests.exceptions.ConnectionError as e:
+                    log.warning('[HTTP] [{}] [requests.exceptions.ConnectionError] {}'.format(info['CMD'], e))
+                    if retry >= MAXRETRY or time() > deadline:
+                        raise e
+                except requests.exceptions.ChunkedEncodingError as e: # python2 requests error
+                    log.warning('[HTTP] [{}] [requests.exceptions.ChunkedEncodingError] {}'.format(info['CMD'], e))
+                    if retry >= MAXRETRY or time() > deadline:
+                        raise e
+                except NeoregReponseFormatError as e: # python2 requests error
+                    log.warning("[%s] [%s:%d] NeoregReponseFormatError, Retry: No.%d" % (info['CMD'], self.target, self.port, retry))
+                    if retry >= MAXRETRY or time() > deadline:
+                        raise e
+
+                sleep(min(0.1 * retry, 1.0))
+
+
+    def touch_data_activity(self):
+        with self.activity_lock:
+            self.last_data_active = time()
+            self.missed_heartbeats = 0
+
+
+    def heartbeat(self):
+        if HEARTBEAT_INTERVAL <= 0 or not HEARTBEAT_CAPABLE:
+            return
+
+        info = {'CMD': 'PING', 'MARK': self.mark}
+        should_close = False
+        while not self.connect_closed:
+            self.heartbeat_stop.wait(max(1.0, HEARTBEAT_INTERVAL / 2.0))
+            if self.connect_closed:
+                break
+
+            with self.activity_lock:
+                idle_for = time() - self.last_data_active
+
+            if idle_for < HEARTBEAT_INTERVAL:
+                continue
+
             try:
-                response = self.conn.post(self.url_sample(), headers=HEADERS, timeout=timeout, data=data)
-
-                second = response.elapsed.total_seconds()
-
-                log.debug("[HTTP] [%s:%d] %s Response (%s) => HttpCode: %d, Time: %.2fs" % (self.target, self.port, info['CMD'], self.mark, response.status_code, second))
-
-                rdata = extract_body(response.content)
-                rinfo = decode_body(rdata)
-                if rinfo is None:
-                    raise NeoregReponseFormatError("[HTTP] Response Format Error: {}".format(response.content))
+                rinfo = self.neoreg_request(info, timeout=3)
+                if rinfo.get('STATUS') == 'OK':
+                    self.touch_data_activity()
                 else:
-                    if rinfo['STATUS'] != 'OK' and info['CMD'] != 'DISCONNECT':
-                        log.warning('[%s] [%s:%d] Error: %s' % (info['CMD'], self.target, self.port, rinfo['ERROR']))
-                    return rinfo
+                    with self.activity_lock:
+                        self.missed_heartbeats += 1
+                        missed = self.missed_heartbeats
+                    log.warning('[PING] [%s:%d] Heartbeat failed (%d/%d)' % (self.target, self.port, missed, HEARTBEAT_MAX_MISSES))
+                    if missed >= HEARTBEAT_MAX_MISSES:
+                        should_close = True
+                        break
+            except NeoregReponseFormatError as ex:
+                log.warning('[PING] [%s:%d] Heartbeat disabled for incompatible server response: %s' % (self.target, self.port, ex))
+                break
+            except Exception as ex:
+                with self.activity_lock:
+                    self.missed_heartbeats += 1
+                    missed = self.missed_heartbeats
+                log.warning('[PING] [%s:%d] Heartbeat exception (%d/%d): %s' % (self.target, self.port, missed, HEARTBEAT_MAX_MISSES, ex))
+                if missed >= HEARTBEAT_MAX_MISSES:
+                    should_close = True
+                    break
 
-                # 高并发下，csharp 容易出现 503, 重试即可
-                log.warning("[HTTP] [%s:%d] [ReTry %d] %s Request (%s) => HttpCode: %d" % (self.target, self.port, retry, info['CMD'], self.mark, response.status_code))
-
-            except requests.exceptions.ConnectionError as e:
-                log.warning('[HTTP] [{}] [requests.exceptions.ConnectionError] {}'.format(info['CMD'], e))
-            except requests.exceptions.ChunkedEncodingError as e: # python2 requests error
-                log.warning('[HTTP] [{}] [requests.exceptions.ChunkedEncodingError] {}'.format(info['CMD'], e))
-            except NeoregReponseFormatError as e: # python2 requests error
-                log.warning("[%s] [%s:%d] NeoregReponseFormatError, Retry: No.%d" % (info['CMD'], self.target, self.port, retry))
-                if retry > MAXRETRY:
-                    raise e
+        if should_close:
+            self.closeRemoteSession()
 
 
     def setupRemoteSession(self, target, port):
@@ -501,23 +575,30 @@ class session(Thread):
 
 
     def closeRemoteSession(self):
-        if not self.connect_closed:
+        with self.close_lock:
+            if self.connect_closed:
+                return
             self.connect_closed = True
-            try:
-                self.pSocket.close()
-                log.debug("[DISCONNECT] [%s:%d] Closing localsocket" % (self.target, self.port))
-            except:
-                if hasattr(self, 'target'):
-                    log.debug("[DISCONNECT] [%s:%d] Localsocket already closed" % (self.target, self.port))
+        self.heartbeat_stop.set()
 
-            if hasattr(self, 'mark'):
-                info = {'CMD': 'DISCONNECT', 'MARK': self.mark}
-                rinfo = self.neoreg_request(info)
-            if not self.connect_closed:
-                if hasattr(self, 'target'):
-                    log.info("[DISCONNECT] [%s:%d] Connection Terminated" % (self.target, self.port))
-                else:
-                    log.error("[DISCONNECT] Connection Terminated")
+        try:
+            self.pSocket.close()
+            log.debug("[DISCONNECT] [%s:%d] Closing localsocket" % (self.target, self.port))
+        except:
+            if hasattr(self, 'target'):
+                log.debug("[DISCONNECT] [%s:%d] Localsocket already closed" % (self.target, self.port))
+
+        if hasattr(self, 'mark'):
+            info = {'CMD': 'DISCONNECT', 'MARK': self.mark}
+            try:
+                self.neoreg_request(info, timeout=3)
+            except Exception as ex:
+                log.debug("[DISCONNECT] [%s:%d] Remote disconnect failed: %s" % (self.target, self.port, ex))
+
+        if hasattr(self, 'target'):
+            log.info("[DISCONNECT] [%s:%d] Connection Terminated" % (self.target, self.port))
+        else:
+            log.error("[DISCONNECT] Connection Terminated")
 
 
     def reader(self):
@@ -526,7 +607,7 @@ class session(Thread):
             n = 0
             while True:
                 try:
-                    if self.connect_closed or self.pSocket.fileno() == -1:
+                    if self.connect_closed:
                         break
                     rinfo = self.neoreg_request(info)
                     if rinfo['STATUS'] == 'OK':
@@ -536,10 +617,13 @@ class session(Thread):
                         if data_len == 0:
                             sleep(READINTERVAL)
                         elif data_len > 0:
+                            self.touch_data_activity()
                             n += 1
                             transferLog.info("[%s:%d] [%s] No.%d <<<< [%d byte]" % (self.target, self.port, self.mark, n, data_len))
                             while data:
                                 writed_size = self.pSocket.send(data)
+                                if writed_size <= 0:
+                                    raise OSError("local socket closed while sending")
                                 data = data[writed_size:]
                             if data_len < 500:
                                 sleep(READINTERVAL)
@@ -547,7 +631,11 @@ class session(Thread):
                         break
 
                 except error: # python2 socket.send error
-                    pass
+                    break
+                except timeout:
+                    continue
+                except OSError:
+                    break
                 except Exception as ex:
                     log.exception(ex)
                     break
@@ -568,6 +656,7 @@ class session(Thread):
                     rinfo = self.neoreg_request(info)
                     if rinfo['STATUS'] != "OK":
                         break
+                    self.touch_data_activity()
                     n += 1
                     transferLog.info("[%s:%d] [%s] No.%d >>>> [%d byte]" % (self.target, self.port, self.mark, n, len(raw_data)))
                     if len(raw_data) < READBUFSIZE:
@@ -577,6 +666,9 @@ class session(Thread):
                 except error:
                     break
                 except OSError:
+                    break
+                except requests.exceptions.RequestException as ex:
+                    log.warning('[FORWARD] [%s:%d] HTTP request failed: %s' % (self.target, self.port, ex))
                     break
                 except Exception as ex:
                     log.exception(ex)
@@ -595,10 +687,14 @@ class session(Thread):
             if self.session_connected:
                 r = Thread(target=self.reader)
                 w = Thread(target=self.writer)
+                h = Thread(target=self.heartbeat)
                 r.start()
                 w.start()
+                h.start()
                 r.join()
                 w.join()
+                self.closeRemoteSession()  # sets connect_closed=True so heartbeat exits cleanly
+                h.join()
         except NeoregReponseFormatError as ex:
             log.error('[HTTP] [NeoregReponseFormatError] {}'.format(ex))
         except SocksCmdNotImplemented as ex:
@@ -698,6 +794,34 @@ def askNeoGeorg(conn, connectURLs, redirectURLs, force_redirect):
             log.error("[Ask NeoGeorg] NeoGeorg is not ready, please check URL and KEY. rep: [{}] {}".format(response.status_code, response.reason))
             log.error("[Ask NeoGeorg] You can set the `--skip` parameter to ignore errors")
             exit()
+
+
+def checkHeartbeatSupport(conn, connectURLs, redirectURLs, force_redirect):
+    headers = {}
+    headers.update(HEADERS)
+    headers.update({'Content-type': 'application/octet-stream'})
+
+    info = {'CMD': 'PING', 'MARK': 'hb-capability-check'}
+    if redirectURLs:
+        info['REDIRECTURL'] = redirectURLs[0]
+        if force_redirect:
+            info['FORCEREDIRECT'] = 'TRUE'
+        else:
+            info['FORCEREDIRECT'] = 'FALSE'
+
+    try:
+        data = encode_body(info)
+        response = conn.post(connectURLs[0], headers=headers, timeout=5, data=data)
+        rdata = extract_body(response.content)
+        rinfo = decode_body(rdata)
+        if rinfo and 'STATUS' in rinfo:
+            log.info('[Heartbeat] Server supports PING command')
+            return True
+    except Exception as ex:
+        log.debug('[Heartbeat] Capability probe failed: {}'.format(ex))
+
+    log.warning('[Heartbeat] Server does not appear to support PING command')
+    return False
 
 
 def extract_body(data):
@@ -809,6 +933,11 @@ if __name__ == '__main__':
         parser.add_argument("--write-interval", metavar="MS", help="Write data interval in milliseconds (default: {})".format(WRITEINTERVAL), type=int, default=WRITEINTERVAL)
         parser.add_argument("--max-threads", metavar="N", help="Proxy max threads (default: {})".format(MAXTHERADS), type=int, default=MAXTHERADS)
         parser.add_argument("--max-retry", metavar="N", help="Max retry requests (default: {})".format(MAXRETRY), type=int, default=MAXRETRY)
+        parser.add_argument("--request-timeout", metavar="S", help="Timeout for each HTTP request in seconds (default: {})".format(REQUEST_TIMEOUT), type=float, default=REQUEST_TIMEOUT)
+        parser.add_argument("--request-deadline", metavar="S", help="Max total time to retry one command in seconds (default: {})".format(REQUEST_DEADLINE), type=float, default=REQUEST_DEADLINE)
+        parser.add_argument("--heartbeat-interval", metavar="S", help="Heartbeat interval in seconds for idle sessions (default: {})".format(HEARTBEAT_INTERVAL), type=float, default=HEARTBEAT_INTERVAL)
+        parser.add_argument("--heartbeat-max-misses", metavar="N", help="Maximum missed heartbeats before closing session (default: {})".format(HEARTBEAT_MAX_MISSES), type=int, default=HEARTBEAT_MAX_MISSES)
+        parser.add_argument("--heartbeat-mode", choices=['auto', 'on', 'off'], default=HEARTBEAT_MODE, help="Heartbeat behavior: auto detect support, force on, or disable")
         parser.add_argument("--cut-left", metavar="N", help="Truncate the left side of the response body", type=int, default=0)
         parser.add_argument("--cut-right", metavar="N", help="Truncate the right side of the response body", type=int, default=0)
         parser.add_argument("--extract", metavar="EXPR", help="Manually extract BODY content (eg: <html><p>NEOREGBODY</p></html> )")
@@ -966,6 +1095,24 @@ if __name__ == '__main__':
             READBUFSIZE   = min(args.read_buff, 50) * 1024
             MAXTHERADS    = args.max_threads
             MAXRETRY      = args.max_retry
+            REQUEST_TIMEOUT = max(0.1, args.request_timeout)
+            REQUEST_DEADLINE = max(1.0, args.request_deadline)
+            HEARTBEAT_INTERVAL = max(0.0, args.heartbeat_interval)
+            HEARTBEAT_MAX_MISSES = max(1, args.heartbeat_max_misses)
+            HEARTBEAT_MODE = args.heartbeat_mode
+
+            if HEARTBEAT_MODE == 'off':
+                HEARTBEAT_CAPABLE = False
+                HEARTBEAT_INTERVAL = 0.0
+            elif HEARTBEAT_INTERVAL > 0:
+                HEARTBEAT_CAPABLE = checkHeartbeatSupport(conn, urls, redirect_urls, args.force_redirect)
+                if HEARTBEAT_MODE == 'on' and not HEARTBEAT_CAPABLE:
+                    log.error('[Heartbeat] --heartbeat-mode on was requested, but server does not support PING')
+                    exit()
+                if HEARTBEAT_MODE == 'auto' and not HEARTBEAT_CAPABLE:
+                    log.warning('[Heartbeat] Auto mode disabled heartbeat due to unsupported template')
+                    HEARTBEAT_INTERVAL = 0.0
+
             READINTERVAL  = args.read_interval  /   1000.0
             WRITEINTERVAL = args.write_interval /   1000.0
 
@@ -999,7 +1146,7 @@ if __name__ == '__main__':
                     pass
                 except Exception as ex:
                     log.exception(ex)
-                    raise e
+                    raise ex
         except requests.exceptions.ProxyError:
             log.error("[HTTP] Unable to connect proxy: %s" % args.proxy)
         except requests.exceptions.ConnectionError:

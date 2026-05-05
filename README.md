@@ -157,6 +157,9 @@ $ python neoreg.py -h
                      [-a] [--php-skip-cookie] [--go] [--php-connect-timeout S]
                      [--local-dns] [--read-buff KB] [--read-interval MS]
                      [--write-interval MS] [--max-threads N] [--max-retry N]
+                     [--request-timeout S] [--request-deadline S]
+                     [--heartbeat-interval S] [--heartbeat-max-misses N]
+                     [--heartbeat-mode {auto,on,off}]
                      [--cut-left N] [--cut-right N] [--extract EXPR]
                      [--ntlm-auth USER:PASS] [-v]
 
@@ -199,6 +202,19 @@ $ python neoreg.py -h
       --write-interval MS   Write data interval in milliseconds (default: 200)
       --max-threads N       Proxy max threads (default: 400)
       --max-retry N         Max retry requests (default: 10)
+      --request-timeout S   Timeout for each HTTP request in seconds
+                (default: 10)
+      --request-deadline S  Max total time to retry one command in seconds
+                (default: 30)
+      --heartbeat-interval S
+                Heartbeat interval in seconds for idle sessions
+                (default: 30)
+      --heartbeat-max-misses N
+                Maximum missed heartbeats before closing session
+                (default: 3)
+      --heartbeat-mode {auto,on,off}
+                Heartbeat behavior: auto detect support, force on,
+                or disable
       --cut-left N          Truncate the left side of the response body
       --cut-right N         Truncate the right side of the response body
       --extract EXPR        Manually extract BODY content (eg:
@@ -214,7 +230,38 @@ $ python neoreg.py -h
 ## Remind
 
 * Mac OSX 上运行 `neoreg.py` 时，高并发请求会出现网络丢包情况，可通过 `ulimit -n 2560` 修改当前 shell 的 "最大文件打开数"
+* 默认开启心跳检测。混合部署建议使用 `--heartbeat-mode auto`，严格要求 PING 支持时使用 `--heartbeat-mode on`，不使用心跳可设置 `--heartbeat-mode off`。
 
+
+## Soak Check
+
+在启动 `neoreg.py` 后，可运行以下命令做 SOCKS5 稳定性压测：
+
+```bash
+python scripts/soak_runner.py \
+  --proxy-host 127.0.0.1 --proxy-port 1080 \
+  --target-host example.com --target-port 80 \
+  --duration 1800 --interval 2 \
+  --min-success-rate 0.95 --max-consecutive-failures 5
+```
+
+可选：发送 HTTP 请求并检查返回内容：
+
+```bash
+python scripts/soak_runner.py \
+  --target-host example.com --target-port 80 \
+  --send-data "HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n" \
+  --expect-substring "HTTP/1.1"
+```
+
+一条命令完成全流程（启动 neoreg、执行 soak、结束 neoreg）：
+
+```bash
+python scripts/run_soak_session.py \
+  -k password -u http://127.0.0.1:8000/tunnel.php \
+  --target-host example.com --target-port 80 \
+  --duration 1800 --interval 2
+```
 
 
 ## License

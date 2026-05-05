@@ -156,6 +156,9 @@ $ python neoreg.py -h
                      [-a] [--php-skip-cookie] [--go] [--php-connect-timeout S]
                      [--local-dns] [--read-buff KB] [--read-interval MS]
                      [--write-interval MS] [--max-threads N] [--max-retry N]
+                     [--request-timeout S] [--request-deadline S]
+                     [--heartbeat-interval S] [--heartbeat-max-misses N]
+                     [--heartbeat-mode {auto,on,off}]
                      [--cut-left N] [--cut-right N] [--extract EXPR]
                      [--ntlm-auth USER:PASS] [-v]
 
@@ -198,6 +201,19 @@ $ python neoreg.py -h
       --write-interval MS   Write data interval in milliseconds (default: 200)
       --max-threads N       Proxy max threads (default: 400)
       --max-retry N         Max retry requests (default: 10)
+      --request-timeout S   Timeout for each HTTP request in seconds
+                (default: 10)
+      --request-deadline S  Max total time to retry one command in seconds
+                (default: 30)
+      --heartbeat-interval S
+                Heartbeat interval in seconds for idle sessions
+                (default: 30)
+      --heartbeat-max-misses N
+                Maximum missed heartbeats before closing session
+                (default: 3)
+      --heartbeat-mode {auto,on,off}
+                Heartbeat behavior: auto detect support, force on,
+                or disable
       --cut-left N          Truncate the left side of the response body
       --cut-right N         Truncate the right side of the response body
       --extract EXPR        Manually extract BODY content (eg:
@@ -213,6 +229,38 @@ $ python neoreg.py -h
 ## Remind
 
 * When running `neoreg.py` with high concurrency on Mac OSX, a large number of network requests will be lost. You can use `ulimit -n 2560` to modify the "maximum number of open files" of the current shell.
+* Heartbeat is enabled by default. Use `--heartbeat-mode auto` for mixed deployments, `--heartbeat-mode on` for strict PING-only environments, or `--heartbeat-mode off` to disable it.
+
+
+## Soak Check
+
+Run a quick SOCKS5 stability soak test after starting `neoreg.py`:
+
+```bash
+python scripts/soak_runner.py \
+  --proxy-host 127.0.0.1 --proxy-port 1080 \
+  --target-host example.com --target-port 80 \
+  --duration 1800 --interval 2 \
+  --min-success-rate 0.95 --max-consecutive-failures 5
+```
+
+Optional HTTP probe with response check:
+
+```bash
+python scripts/soak_runner.py \
+  --target-host example.com --target-port 80 \
+  --send-data "HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n" \
+  --expect-substring "HTTP/1.1"
+```
+
+Run everything in one command (start neoreg, run soak, stop neoreg):
+
+```bash
+python scripts/run_soak_session.py \
+  -k password -u http://127.0.0.1:8000/tunnel.php \
+  --target-host example.com --target-port 80 \
+  --duration 1800 --interval 2
+```
 
 
 ## License
